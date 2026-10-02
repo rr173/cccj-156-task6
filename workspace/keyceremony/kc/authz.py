@@ -99,13 +99,14 @@ APPROVER_DUTIES: dict[str, frozenset[str]] = {
 READ_SCOPES: dict[str, frozenset[str]] = {
     P.ROOT_OWNER: frozenset(
         {"keys", "ceremonies", "policies", "participants",
-         "audit", "export", "tickets", "sessions", "drills"}),
+         "audit", "export", "tickets", "sessions", "drills",
+         "transparency"}),
     P.KEY_STEWARD: frozenset(
         {"keys", "ceremonies", "policies", "participants", "tickets",
          "drills"}),
     P.WITNESS_SHAREHOLDER: frozenset(
         {"keys", "ceremonies", "policies", "participants",
-         "audit", "export", "tickets", "drills"}),
+         "audit", "export", "tickets", "drills", "transparency"}),
     P.ENCLAVE_OPERATOR: frozenset(
         {"keys", "ceremonies", "policies", "tickets", "drills"}),
 }
@@ -116,6 +117,7 @@ CAPABILITIES: dict[str, frozenset[str]] = {
         "ticket:create", "ticket:approve", "ticket:withdraw",
         "drill:plan", "drill:scan", "drill:run", "drill:mirror",
         "drill:lease", "drill:failback", "drill:terminate",
+        "transparency:resolve",
     }),
     P.KEY_STEWARD: frozenset({
         "ceremony:open", "device:step", "sign:use",

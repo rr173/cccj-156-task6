@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Key Directory Transparency Log</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --line:#27314a; --ink:#d8e0f0;
+          --muted:#8a97b5; --ok:#3fd08a; --warn:#f0b34a; --err:#ef6a6a;
+          --accent:#6aa6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; letter-spacing:.5px; }
+  header span { color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:14px; min-height:90px; }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px;
+              color:var(--muted); margin:0 0 10px; }
+  .full { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td,th { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line);
+          vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px;
+          font-size:11px; border:1px solid var(--line); }
+  .PASS { color:var(--ok); border-color:var(--ok); }
+  .FAIL { color:var(--err); border-color:var(--err); }
+  .FROZEN,.OPEN { color:var(--err); border-color:var(--err); }
+  .RESOLVED { color:var(--ok); border-color:var(--ok); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+  input,button,textarea,select { background:#0d1220; color:var(--ink);
+    border:1px solid var(--line); border-radius:7px; padding:7px 10px;
+    font:inherit; }
+  button { cursor:pointer; }
+  button.primary { border-color:var(--accent); color:var(--accent); }
+  pre { white-space:pre-wrap; word-break:break-all; max-height:280px;
+        overflow:auto; background:#0c1120; border:1px solid var(--line);
+        border-radius:8px; padding:10px; }
+  small { color:var(--muted); }
+  .verdict { font-weight:700; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KEY DIRECTORY · TRANSPARENCY LOG</h1>
+  <span>append-only Merkle tree · caller-verified inclusion &amp; consistency · gossip split-view</span>
+  <span style="margin-left:auto">
+    <button onclick="refreshAll()">refresh</button>
+    <small>results below are RECOMPUTED in this browser, not trusted from the API</small>
+  </span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Current signed tree head</h2>
+    <div id="headInfo"><small>loading…</small></div>
+  </section>
+  <section class="panel">
+    <h2>Split-view / freeze state</h2>
+    <div id="splitInfo"><small>loading…</small></div>
+  </section>
+
+  <section class="panel full">
+    <h2>Latest public version per purpose</h2>
+    <div id="latestVersions"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Verify inclusion (purpose + version)</h2>
+    <div class="row">
+      <input id="incPurpose" placeholder="purpose" value="root-signing"/>
+      <input id="incVersion" placeholder="version" value="1" style="width:90px"/>
+      <button class="primary" onclick="checkInclusion()">fetch &amp; verify leaf</button>
+    </div>
+    <pre id="incOut">not run</pre>
+  </section>
+
+  <section class="panel">
+    <h2>Check consistency from a pinned old head</h2>
+    <small>Paste an old signed head (JSON) you saved. The browser recomputes
+      the consistency proof and refuses a non-append new head.</small>
+    <textarea id="oldHead" rows="4" style="width:100%"
+      placeholder='{"head":{...},"head_digest":"...","svc_sig":"..."}'></textarea>
+    <div class="row" style="margin-top:6px">
+      <button class="primary" onclick="pinHead()">pin this head (localStorage)</button>
+      <button onclick="loadPinned()">load pinned</button>
+      <button onclick="checkConsistency()">verify against current head</button>
+    </div>
+    <pre id="consOut">not run</pre>
+  </section>
+
+  <section class="panel full">
+    <h2>Gossip: submit a signed head you observed</h2>
+    <div class="row">
+      <input id="observer" placeholder="observer id" value="browser-monitor"/>
+    </div>
+    <textarea id="gossipHead" rows="4" style="width:100%"
+      placeholder="pasted signed head JSON"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button class="primary" onclick="submitGossip()">submit observed head</button>
+    </div>
+    <pre id="gossipOut">not run</pre>
+  </section>
+
+  <section class="panel full">
+    <h2>Conflict branches &amp; disposition</h2>
+    <div id="branches"></div>
+    <div class="row" style="margin-top:8px">
+      <input id="resolveSplit" placeholder="split_id" style="width:120px"/>
+      <input id="resolveRoot" placeholder="accepted root (hex)"/>
+      <input id="resolveBy" placeholder="decided_by"/>
+      <input id="resolveReason" placeholder="reason (required)"/>
+      <button onclick="resolveSplit()">dispose with reason</button>
+    </div>
+    <pre id="resolveOut"></pre>
+  </section>
+</main>
+
+<script>
+const API = "";
+async function jget(p){ const r=await fetch(API+p); return r.json(); }
+async function jpost(p,b){ const r=await fetch(API+p,{method:"POST",
+  headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
+  return r.json(); }
+function hex(b){ return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join(""); }
+function bytes(h){ const a=new Uint8Array(h.length/2); for(let i=0;i<a.length;i++) a[i]=parseInt(h.substr(i*2,2),16); return a; }
+async function sha(b){ return new Uint8Array(await crypto.subtle.digest("SHA-256",b)); }
+function cat(a,b){ const c=new Uint8Array(a.length+b.length); c.set(a,0); c.set(b,a.length); return c; }
+function lhash(leaf){
+  const body=new TextEncoder().encode(canonical(leafContent(leaf)));
+  const pre=new Uint8Array(body.length+1); pre[0]=0; pre.set(body,1);
+  return sha(pre);
+}
+async function pair(l,r){ const pre=new Uint8Array(l.length+r.length+1); pre[0]=1;
+  pre.set(l,1); pre.set(r,1+l.length); return sha(pre); }
+const FIELDS=["purpose","version","fingerprint","prev_state","next_state",
+  "ceremony_id","event","audit_seq","audit_digest"];
+function leafContent(l){ const o={}; for(const k of FIELDS)o[k]=l[k]; return o; }
+function canonical(o){ return JSON.stringify(sort(o)); }
+function sort(o){ if(Array.isArray(o)) return o.map(sort);
+  if(o&&typeof o==="object"){ const r={};
+    for(const k of Object.keys(o).sort()) r[k]=sort(o[k]); return r; }
+  return o; }
+
+async function verifyInclusion(leafHash,index,size,path,root){
+  let idx=index,n=size; let acc=leafHash; let pi=0;
+  while(n>1){
+    if(!(n%2===1 && idx===n-1)){
+      // consume a sibling ONLY on a real fold, never on an odd promotion
+      if(pi>=path.length) return {ok:false,why:"path too short"};
+      const sib=bytes(path[pi++]);
+      acc=(idx%2)?await pair(sib,acc):await pair(acc,sib);
+    }
+    n=(n+1)>>1; idx=idx>>1;
+  }
+  if(pi!==path.length) return {ok:false,why:"extra path node"};
+  return {ok: hex(acc)===root, got:hex(acc), want:root};
+}
+
+async function verifyConsistency(oldSize,newSize,proof,oldRoot,newRoot){
+  // two inclusion folds of the public boundary leaf
+  const lh=bytes(proof.leaf);
+  const a=await verifyInclusion(lh,proof.leaf_index,oldSize,proof.old_path,oldRoot);
+  if(!a.ok) return {ok:false,why:"old-prefix fold failed: "+a.why};
+  const b=await verifyInclusion(lh,proof.leaf_index,newSize,proof.new_path,newRoot);
+  if(!b.ok) return {ok:false,why:"new-tree fold failed: "+b.why};
+  return {ok:true};
+}
+
+let STATUS=null;
+function verdict(ok){ return '<span class="pill '+(ok?'PASS':'FAIL')+'">'+(ok?'BROWSER VERIFIED ✓':'FAILED ✗')+'</span>'; }
+
+async function refreshAll(){
+  STATUS=await jget("/api/tlog/status");
+  const h=STATUS.current_head;
+  document.getElementById("headInfo").innerHTML = h ? `
+    <table>
+      <tr><th>tree size</th><td>${h.head.tree_size}</td></tr>
+      <tr><th>root</th><td>${h.head.root}</td></tr>
+      <tr><th>prev head</th><td>${h.head.prev_head}</td></tr>
+      <tr><th>issued at</th><td>${h.head.issued_at}</td></tr>
+      <tr><th>head digest</th><td>${h.head_digest}</td></tr>
+    </table>` : "<small>empty log (no head yet)</small>";
+  document.getElementById("splitInfo").innerHTML =
+    (STATUS.frozen?'<span class="pill FROZEN">FROZEN</span>':'<span class="pill PASS">publishing open</span>')
+    + ` · ${(STATUS.split_views||[]).length} split-view record(s)`;
+  const lv=STATUS.latest_versions||{};
+  let rows=Object.keys(lv).sort().map(p=>`<tr><td>${p}</td><td>v${lv[p].version}</td>
+     <td>${lv[p].state}</td><td>${lv[p].fingerprint}</td><td>leaf #${lv[p].leaf_index}</td></tr>`).join("");
+  document.getElementById("latestVersions").innerHTML =
+    `<table><tr><th>purpose</th><th>version</th><th>state</th><th>fingerprint</th><th>leaf</th></tr>${rows}</table>`;
+  renderBranches();
+}
+
+async function checkInclusion(){
+  const purpose=document.getElementById("incPurpose").value;
+  const version=parseInt(document.getElementById("incVersion").value,10);
+  const out=document.getElementById("incOut");
+  const m=await jget(`/api/tlog/leaves?purpose=${encodeURIComponent(purpose)}&version=${version}`);
+  if(!m.matches||!m.matches.length){ out.textContent="no leaf found"; return; }
+  // verify EVERY leaf for this version (creation..destroy all remain queryable)
+  let txt="";
+  for(const hit of m.matches){
+    const inc=await jget(`/api/tlog/inclusion?index=${hit.index}`);
+    const lh=await lhash(hit.leaf);
+    const res=await verifyInclusion(lh,inc.index,inc.tree_size,
+       inc.inclusion_path,inc.head.head.root);
+    txt += `leaf #${hit.index} ${hit.leaf.event} ${hit.leaf.prev_state||"∅"}→${hit.leaf.next_state} `
+         + `${verdict(res.ok)}\n   fp ${hit.leaf.fingerprint}  audit #${hit.leaf.audit_seq}\n`
+         + (res.ok?"":`   recomputed ${res.got}\n   wanted     ${res.want}\n`);
+  }
+  out.textContent=txt;
+}
+
+function pinHead(){
+  try{ const o=JSON.parse(document.getElementById("oldHead").value);
+    localStorage.setItem("kc-tlog-pinned-head",JSON.stringify(o));
+    document.getElementById("consOut").textContent="pinned head "+o.head_digest;
+  }catch(e){ document.getElementById("consOut").textContent="bad JSON: "+e; }
+}
+function loadPinned(){
+  const s=localStorage.getItem("kc-tlog-pinned-head");
+  if(s) document.getElementById("oldHead").value=s;
+}
+async function checkConsistency(){
+  const out=document.getElementById("consOut");
+  let old;
+  try{ old=JSON.parse(document.getElementById("oldHead").value); }
+  catch(e){ out.textContent="bad old head JSON"; return; }
+  const oldSize=old.head.tree_size, oldRoot=old.head.root;
+  const cur=await jget("/api/tlog/head");
+  const c=await jget(`/api/tlog/consistency?old_size=${oldSize}`);
+  let res;
+  if(oldSize===cur.head.tree_size){
+    res={ok: oldRoot===cur.head.root};
+  }else{
+    res=await verifyConsistency(oldSize,c.new_size,c.proof,oldRoot,cur.head.root);
+  }
+  out.innerHTML = `${verdict(res.ok)} old size ${oldSize} → new size ${cur.head.tree_size}\n`
+    + (res.ok?"new head is a strict append of the pinned tree":("NOT APPEND: "+(res.why||"root mismatch")));
+  out.textContent = out.textContent;
+}
+
+async function submitGossip(){
+  const out=document.getElementById("gossipOut");
+  let sh;
+  try{ sh=JSON.parse(document.getElementById("gossipHead").value); }
+  catch(e){ out.textContent="bad JSON"; return; }
+  const r=await jpost("/api/tlog/observe",
+    {observer:document.getElementById("observer").value,signed_head:sh});
+  out.textContent=JSON.stringify(r,null,2);
+  if(r.split_view){ await refreshAll(); }
+}
+
+function renderBranches(){
+  const el=document.getElementById("branches");
+  const svs=(STATUS&&STATUS.split_views)||[];
+  if(!svs.length){ el.innerHTML="<small>no split-view events</small>"; return; }
+  el.innerHTML=svs.map(sv=>{
+    const a=sv.our_head?sv.our_head.head:null, b=sv.their_head?sv.their_head.head:null;
+    return `<div style="border-bottom:1px solid var(--line);padding:6px 0">
+      <b>${sv.split_id}</b> <span class="pill ${sv.status}">${sv.status}</span> ${sv.kind}
+      <table><tr><th></th><th>size</th><th>root</th></tr>
+      <tr><td>our/accepted branch</td><td>${a?a.tree_size:"-"}</td><td>${a?a.root:"-"}</td></tr>
+      <tr><td>observed/rejected</td><td>${b?b.tree_size:"-"}</td><td>${b?b.root:"-"}</td></tr></table>
+      ${sv.decision?`<small>resolved by ${sv.decision.decided_by}: ${sv.decision.reason}</small>`:""}
+    </div>`;
+  }).join("");
+}
+async function resolveSplit(){
+  const out=document.getElementById("resolveOut");
+  const id=document.getElementById("resolveSplit").value;
+  const root=document.getElementById("resolveRoot").value.trim();
+  const by=document.getElementById("resolveBy").value.trim();
+  const reason=document.getElementById("resolveReason").value;
+  // disposition requires a logged-in session; reuse session token if present
+  const tok=localStorage.getItem("kc-session-token")||"";
+  const r=await fetch("/api/tlog/resolve",{method:"POST",
+    headers:{"Content-Type":"application/json",
+      ...(tok?{"Authorization":"Bearer "+tok}:{})},
+    body:JSON.stringify({split_id:id,accepted_root:root,reason:reason,decided_by:by})});
+  out.textContent=JSON.stringify(await r.json(),null,2);
+  await refreshAll();
+}
+loadPinned();
+refreshAll();
+</script>
+</body>
+</html>

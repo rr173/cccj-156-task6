@@ -170,8 +170,75 @@ python3 -m kc.archive_cli verify    bundle.json
 
 ---
 
+## 1e. Caller-facing transparency log
+
+**Purpose.** In addition to the service-internal audit chain, every key
+lifecycle change is published into a caller-facing, independently verifiable
+**Merkle transparency log** (`kc/merkle.py`, `kc/transparency.py`). A caller
+can verify creation/staging, activation/handover entry, retirement and
+erasure of *every* purpose/version over public paths without trusting a
+single control instance.
+
+A canonical leaf binds, and only binds:
+
+```jsonc
+{ "purpose", "version", "fingerprint",          // public signing-pub hash
+  "prev_state", "next_state",                    // STAGED/ACTIVE/RETIRING/...
+  "ceremony_id", "event",
+  "audit_seq", "audit_digest" }                  // reference to the audit entry
+```
+
+No shares, signing seeds or sealing/wrapping material are ever in a leaf
+(enforced structurally by the allow-list `merkle.LEAF_FIELDS`). Leaves enter
+an append-only RFC-6962-style Merkle tree; the service signs **tree heads**
+`{tree_size, root, prev_head_digest, issued_at}`.
+
+Guarantees:
+
+| Property | Means |
+|---|---|
+| Same business change once | de-dup key `(purpose, version, event, audit_seq)`; a re-delivered audit event returns the original leaf index |
+| No contradictory state | same `(purpose, version)` with a different fingerprint, or a forbidden state jump, freezes the log and blocks the new head instead of picking a side |
+| Inclusion | `/api/tlog/inclusion?index=N` returns leaf + sibling path + signed head; the client recomputes the root |
+| Strict append | `/api/tlog/consistency?old_size=M` binds the public boundary leaf into the old and the new tree; holding only `(M, root)` proves the first M leaves are byte-identical. Truncation, reordering, key replacement and spliced foreign paths all fail |
+| Erasure still auditable | a DESTROYED version keeps its public leaf/fingerprint; only the private wrap is removed |
+| Multi-process commit | sequencing a leaf, writing it, updating nodes and publishing the head are one store-lock transaction on one atomic state file; racing publishers serialize on the flock |
+| Crash atomicity | an exit between steps leaves only the complete old head or the complete new head; reopen heals any durable-but-unlogged audit event idempotently |
+| Gossip split-view | anyone POSTs a signed head it saw to `/api/tlog/observe`. A different root at the same size, or a head that is not a strict append, records a split-view, **freezes transparency publishing and new key activation**, and retains both heads as evidence. Historical signature verification still works during the freeze. |
+| Recovery | the operator chooses a branch *provably* extending the last trusted head (reason + actor recorded); the rejected head stays evidence; publishing resumes only on a continuous chain |
+
+Public read/gossip API needs no session token (callers must not trust one
+control instance):
+```
+GET  /transparency                 browser verification console
+GET  /api/tlog/status   /head   /leaves?purpose=&version=&audit_seq=
+GET  /api/tlog/inclusion?index=N   /consistency?old_size=M
+GET  /api/tlog/bundle   /splits
+POST /api/tlog/observe   {observer,signed_head}
+POST /api/tlog/resolve   {split_id,accepted_root,reason,decided_by}  (ROOT_OWNER)
+```
+The `/transparency` console never treats "API returned success" as a result:
+it recomputes leaf hashes and folds every inclusion/consistency path in the
+browser (WebCrypto SHA-256), shows an explicit PASS/FAIL, and keeps the pinned
+trusted head across refreshes (`localStorage`).
+
+Offline independent checker:
+```bash
+python3 -m kc.transparency_cli export --root ./kc-data --out tlog.json
+python3 -m kc.transparency_cli verify tlog.json   # recomputes all roots/paths
+```
+It reports specific codes for missing leaves, duplicate business events,
+reordering, bad inclusion paths, broken consistency, replaced head
+signatures, same-size double roots, publishing past an open conflict, and an
+ACTIVE key with no transparency leaf. This log is purely additive: all
+original ceremonies, signatures and export interfaces keep working.
+
+---
+
 
 ## 2. 目录结构
+
+
 
 ```
 kc/
@@ -189,6 +256,11 @@ kc/
   archive_verify.py 档案离线验证器：删段/换段/伪造/断链/重复计入/越缺口/未决发布/根篡改
   archive_server.py 档案 HTTP API + 汇聚台（archive.html）
   archive_cli.py  档案命令行（init/register/mksample/worker/recover/resolve/publish/export/verify）
+  merkle.py       纯函数 Merkle 数学：叶哈希、包含证明、严格追加一致性证明（浏览器/检查器共用）
+  transparency.py 调用方透明日志：规范化叶、仅追加树、签名树头、去重/矛盾冻结、gossip 分裂视图与处置
+  transparency_verify.py 透明日志独立检查器（缺叶/重复业务事件/调序/错误包含路径/断一致性/双根/跳过冲突/未登记激活…）
+  transparency_cli.py 透明日志命令行（status/leaves/inclusion/consistency/observe/resolve/export/verify）
+  transparency.html 透明日志浏览器页：浏览器端重算包含/一致性路径、固定可信头、提交观察头、冲突处置
   sessions.py     终端证明登录：挑战/报价、绑定人员·职责·终端·时效的会话令牌
   authz.py        四眼授权单：冻结摘要/截止、互补职责矩阵、决策链、单次执行
   console.py      设备侧代理：证明→取件→验份额→签名确认
@@ -210,6 +282,10 @@ tests/
                       迟到数据进下一轮、离线验证正常通过与 12 类篡改失败、HTTP 全流程）
   http_e2e.py         HTTP 全流程含登录门禁、四类授权单、6 路并发批准、库直调不受限
   drill_http_e2e.py   演练 HTTP 全流程（区域/修订/扫描/续跑/镜像/冻结/租约/受阻清理/证据）
+  test_transparency.py 27 个透明日志场景（Merkle 包含/一致性数学与篡改负例、生命周期叶、
+                      重复审计事件幂等、多进程并发追加、硬崩溃原子性、长链一致性、
+                      split-view 冻结/阻断激活/恢复处置、独立检查器各类篡改检出）
+  transparency_http_e2e.py 透明日志 HTTP 全流程（两代包含、旧头一致性、gossip 分裂、冻结、处置）
 ```
 
 ## 3. 快速开始
@@ -220,6 +296,7 @@ python3 -m kc.bootstrap --root ./kc-data
 # 2) 启动控制台/API
 python3 -m kc.server --root ./kc-data --port 8080
 # 浏览器打开 http://127.0.0.1:8080/
+# 透明日志控制台（无需登录即可核验）：http://127.0.0.1:8080/transparency
 ```
 
 控制台按钮对应一次仪式一步（每台设备独立证明、取件、验份额、确认）。

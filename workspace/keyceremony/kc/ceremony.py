@@ -40,6 +40,10 @@ from .errors import (
     ReplayError, SealError,
 )
 from .storage import AuditLog, Store
+from .transparency import (
+    EVENT_ABORTED, EVENT_ACTIVATED, EVENT_CREATED, EVENT_DESTROYED,
+    EVENT_RETIRED, TransparencyFrozen, TransparencyLog,
+)
 
 STAGE_ORDER = ("OPEN", "ATTESTED", "DELIVERED", "CONFIRMED", "COMMIT", "COMPLETED")
 OPEN_STATUS = "OPEN"
@@ -65,6 +69,13 @@ class Orchestrator:
         self.seed = store.service_seed()
         self.audit = AuditLog(store.audit_path, signer_seed=self.seed)
         self.dir = KeyDirectory(self.state, self.seed, clock=clock)
+        # Caller-facing transparency log (append-only Merkle tree). Shares
+        # the store directory; every append happens inside the store lock.
+        self.tlog = TransparencyLog(store)
+        # Heal any leaf whose audit entry durably landed but whose log commit
+        # was interrupted, so the reopened log covers the complete history.
+        if self.audit.entries:
+            self.sync_transparency()
 
     # ======================================================================
     # enrollment / policy
@@ -328,7 +339,73 @@ class Orchestrator:
         return pol.Policy.from_dict(c["policy_snapshot"])
 
     def _audit(self, event: str, payload: dict):
-        self.audit.append(event, payload)
+        return self.audit.append(event, payload)
+
+    def _tlog_event(self, *, event: str, kv: dict, prev_state: str | None):
+        """Append a lifecycle leaf for key version ``kv`` reflecting the
+        just-written audit entry. Audit first (fsync), then the leaf+head
+        commit; a crash between them is healed by ``sync_transparency`` on
+        reopen, keyed by the audit entry (never duplicated)."""
+        audit_entry = self.audit.entries[-1]
+        res = self.tlog.append_lifecycle(
+            purpose=kv["purpose"], version=kv["version"],
+            fingerprint=kv["fingerprint"], prev_state=prev_state,
+            next_state=kv["status"], event=event,
+            ceremony_id=audit_entry["payload"].get("ceremony_id", ""),
+            audit_entry=audit_entry, _persist=False)
+        self.state.setdefault("tlog_refs", {})[kv["id"]] = \
+            self.state.get("tlog_refs", {}).get(kv["id"], [])
+        refs = self.state["tlog_refs"][kv["id"]]
+        tag = {"leaf_index": res["index"], "audit_seq": audit_entry["seq"],
+               "event": event, "duplicate": res["duplicate"]}
+        if tag not in refs:
+            refs.append(tag)
+        return res
+
+    def sync_transparency(self) -> dict:
+        """Heal any audit lifecycle entry not yet committed to the log
+        (crash between the audit fsync and the tlog atomic rename). Idempotent:
+        already-logged events return their original leaf index."""
+        map_event = {
+            "key_activated": (EVENT_CREATED,),
+            "key_staged": (EVENT_CREATED,),
+            "rotation_published": (EVENT_ACTIVATED, EVENT_RETIRED),
+            "key_destroyed": (EVENT_DESTROYED,),
+            "staged_aborted": (EVENT_ABORTED,),
+        }
+        healed = []
+        for e in self.audit.entries:
+            ev = e["event"]
+            if ev not in map_event:
+                continue
+            p = e["payload"]
+            kv = self.state["keys"].get(p.get("version_id"))
+            if kv is None:
+                continue
+            for tev in map_event[ev]:
+                if tev == EVENT_RETIRED:
+                    old_id = p.get("old")
+                    old = self.state["keys"].get(old_id) if old_id else None
+                    target = old
+                    prev = "ACTIVE"
+                else:
+                    target, prev = kv, None
+                if target is None:
+                    continue
+                res = self.tlog.append_lifecycle(
+                    purpose=target["purpose"], version=target["version"],
+                    fingerprint=target["fingerprint"], prev_state=prev,
+                    next_state=target["status"], event=tev,
+                    ceremony_id=p.get("ceremony_id", ""), audit_entry=e,
+                    _persist=False)
+                self.state.setdefault("tlog_refs", {})
+                refs = self.state["tlog_refs"].setdefault(target["id"], [])
+                tag = {"leaf_index": res["index"], "audit_seq": e["seq"],
+                       "event": tev, "duplicate": res["duplicate"]}
+                if tag not in refs:
+                    refs.append(tag)
+                healed.append(tag)
+        return {"healed": healed}
 
     def _spend_nonce(self, body: dict):
         nonce = body["nonce"]
@@ -699,6 +776,14 @@ class Orchestrator:
 
         result = {"actor": actor, "at": _now(self.clock)}
         if c["kind"] in (pol.GENERATE, pol.ROTATE):
+            # A GENERATE commits the first ACTIVE version, so a freeze blocks
+            # it outright. A ROTATE only STAGES a successor; the actual
+            # activation (publish_rotation) is the blocked step, preserving
+            # the ability to prepare a successor during a split-view.
+            if c["kind"] == pol.GENERATE and self.tlog.is_frozen():
+                raise TransparencyFrozen(
+                    "cannot create a new active key while transparency is "
+                    "frozen")
             pending = c["deal"]["pending"]
             seed = crypto.b64d(pending["signing_seed"])
             pub = crypto.b64d(pending["signing_pub"])
@@ -717,11 +802,13 @@ class Orchestrator:
                             {"ceremony_id": c["id"], "version_id": kv["id"],
                              "purpose": kv["purpose"], "version": kv["version"],
                              "fingerprint": kv["fingerprint"]})
+                self._tlog_event(event=EVENT_CREATED, kv=kv, prev_state=None)
             else:
                 self._audit("key_staged",
                             {"ceremony_id": c["id"], "version_id": kv["id"],
                              "purpose": kv["purpose"], "version": kv["version"],
                              "fingerprint": kv["fingerprint"]})
+                self._tlog_event(event=EVENT_CREATED, kv=kv, prev_state=None)
             c["result"] = result
         elif c["kind"] == pol.BACKUP:
             current = self.dir.active(c["purpose"])
@@ -761,6 +848,7 @@ class Orchestrator:
                         {"ceremony_id": c["id"], "version_id": kv["id"],
                          "purpose": kv["purpose"], "version": kv["version"],
                          "fingerprint": kv["fingerprint"]})
+            self._tlog_event(event=EVENT_DESTROYED, kv=kv, prev_state="RETIRING")
 
         c["stage"] = "COMPLETED"
         c["status"] = DONE_STATUS
@@ -796,6 +884,11 @@ class Orchestrator:
         if c.get("published"):
             # Already published and pointer matches: idempotent success.
             return self.public_ceremony(ceremony_id)
+        # A split-view freeze blocks new key activation, but historical
+        # verification remains fully available.
+        if self.tlog.is_frozen():
+            raise TransparencyFrozen(
+                "cannot publish a new generation while transparency is frozen")
         kv, old = self.dir.activate(new_id, c["id"],
                                     expected_active=expected_active)
         c["published"] = {"at": _now(self.clock), "actor": actor,
@@ -808,6 +901,9 @@ class Orchestrator:
                     {"ceremony_id": c["id"], "new": kv["id"],
                      "old": old["id"] if old else None,
                      "handover_deadline": deadline, "actor": actor})
+        self._tlog_event(event=EVENT_ACTIVATED, kv=kv, prev_state="STAGED")
+        if old is not None:
+            self._tlog_event(event=EVENT_RETIRED, kv=old, prev_state="ACTIVE")
         return self.public_ceremony(c["id"])
 
     def abort(self, ceremony_id: str, actor: str, reason: str) -> dict:
@@ -895,4 +991,10 @@ class Orchestrator:
                 for cid in self.state["ceremonies"]]
 
     def save(self):
+        # Single commit boundary across state.json and the transparency log:
+        # state.json renames first (the new key state), then the log commit.
+        # If the process dies in between, the audit entry is already durable
+        # and the next open's sync_transparency re-derives the leaf+head; if
+        # it dies before either rename, only the complete old head is visible.
         self.store.save_state(self.state)
+        self.tlog.save()

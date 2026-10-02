@@ -80,6 +80,7 @@ def build_bundle(orch, sessions=None, authz_mod=None) -> dict:
         "drills": [_public_drill(d) for d in s.get("drills", {}).values()],
         "drill_evidence": list(s.get("drill_evidence", {}).values()),
         "drill_regions": dict(s.get("drill_regions", {})),
+        "transparency": orch.tlog.export_bundle(),
     }
     body["invariants"] = {
         "body_hash_excluding_sig": crypto.digest_hex(
@@ -322,7 +323,21 @@ def verify_bundle(bundle: dict) -> dict:
     drills_ok = _verify_drill_evidence(bundle, pub, problems)
     checks["drill_evidence_ok"] = drills_ok
 
+    # 9. caller-facing transparency log
+    checks["transparency_ok"] = _verify_transparency(bundle, keys, problems)
+
     return {"ok": not problems, "problems": problems, "checks": checks}
+
+
+def _verify_transparency(bundle, keys, problems) -> bool:
+    from . import transparency_verify as tv
+    t = bundle.get("transparency")
+    if t is None:
+        return True  # older bundles without a log remain readable
+    report = tv.verify_bundle(t, keys=keys, strict=False)
+    for f in report["findings"]:
+        problems.append(f"transparency: {f['code']}: {f['message']}")
+    return report["ok"]
 
 
 def _verify_drill_evidence(bundle, service_pub, problems) -> bool:

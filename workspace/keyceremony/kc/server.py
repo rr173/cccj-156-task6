@@ -51,7 +51,8 @@ from . import export as export_mod
 
 CONSOLE_HTML = os.path.join(os.path.dirname(__file__), "console.html")
 
-PUBLIC_GET = {"/", "/index.html", "/health"}
+PUBLIC_GET = {"/", "/index.html", "/health", "/transparency",
+              "/transparency.html"}
 PUBLIC_POST = {"/api/session/login-challenge", "/api/session/login"}
 
 # Device-step endpoints require the session to own the addressed terminal.
@@ -166,8 +167,15 @@ class Handler(BaseHTTPRequestHandler):
         path, q = u.path, parse_qs(u.query)
         if path in ("/", "/index.html"):
             return self._serve_console()
+        if path in ("/transparency", "/transparency.html"):
+            return self._serve_transparency()
         if path == "/health":
             return self._send(200, {"ok": True})
+        # Public transparency API (callers must not trust a single control
+        # instance; these endpoints are readable without a session token so
+        # external monitors can pin heads and verify paths).
+        if path.startswith("/api/tlog"):
+            return self._tlog_get(path, q)
 
         def run(ctx):
             az = ctx.authz
@@ -239,6 +247,12 @@ class Handler(BaseHTTPRequestHandler):
         if path in PUBLIC_POST:
             return self._with_ctx(lambda ctx: self._public_session_path(ctx),
                                   require_auth=False)
+        # Gossip: any external observer may submit a head it has seen (no
+        # operator session needed - that is the point of an observer).
+        if path == "/api/tlog/observe":
+            return self._tlog_observe()
+        if path == "/api/tlog/resolve":
+            return self._with_ctx(self._tlog_resolve)
 
         def run(ctx):
             return self._dispatch(ctx, path)
@@ -256,6 +270,85 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(html)
         except FileNotFoundError:
             self._send(404, {"error": "console unavailable"})
+
+    TRANSPARENCY_HTML = os.path.join(
+        os.path.dirname(__file__), "transparency.html")
+
+    def _serve_transparency(self):
+        try:
+            with open(self.TRANSPARENCY_HTML, "rb") as f:
+                html = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+        except FileNotFoundError:
+            self._send(404, {"error": "transparency console unavailable"})
+
+    # ---- caller-facing transparency log (public, unauthenticated) --------
+    def _tlog_get(self, path, q):
+        try:
+            with self.app.store.locked():
+                from .transparency import TransparencyLog
+                tlog = TransparencyLog(self.app.store)
+                if path == "/api/tlog/status":
+                    return self._send(200, tlog.status())
+                if path == "/api/tlog/head":
+                    h = tlog.current_head()
+                    return self._send(200, h or {})
+                if path == "/api/tlog/leaves":
+                    purpose = q.get("purpose", [None])[0]
+                    version = q.get("version", [None])[0]
+                    audit_seq = q.get("audit_seq", [None])[0]
+                    res = tlog.find_leaves(
+                        purpose=purpose,
+                        version=int(version) if version else None,
+                        audit_seq=int(audit_seq) if audit_seq else None)
+                    return self._send(200, {"matches": res})
+                if path == "/api/tlog/inclusion":
+                    idx = int(q["index"][0])
+                    return self._send(200, tlog.inclusion_for_index(idx))
+                if path == "/api/tlog/consistency":
+                    old = int(q["old_size"][0])
+                    return self._send(200, tlog.consistency(old))
+                if path == "/api/tlog/bundle":
+                    return self._send(200, tlog.export_bundle())
+                if path == "/api/tlog/splits":
+                    return self._send(200,
+                                      {"split_views": tlog.list_split_views()})
+                self._send(404, {"error": "NOT_FOUND", "path": path})
+        except CeremonyError as e:
+            self._error(e)
+        except Exception as e:  # noqa: BLE001
+            self._send(500, {"error": "INTERNAL", "message": str(e)})
+
+    def _tlog_observe(self):
+        try:
+            body = self._read_json()
+        except Exception:
+            return self._send(400, {"error": "BAD_JSON"})
+        try:
+            with self.app.store.locked():
+                from .transparency import TransparencyLog
+                tlog = TransparencyLog(self.app.store)
+                out = tlog.observe_head(body.get("signed_head", body),
+                                        observer=body.get("observer",
+                                                         "external"))
+            self._send(200, out)
+        except CeremonyError as e:
+            self._error(e)
+        except Exception as e:  # noqa: BLE001
+            self._send(500, {"error": "INTERNAL", "message": str(e)})
+
+    def _tlog_resolve(self, ctx):
+        AZ.Authz.require_cap(ctx.session, "transparency:resolve")
+        b = ctx.body
+        out = ctx.orch.tlog.resolve_split(
+            b["split_id"], b["accepted_root"], b["reason"],
+            b.get("decided_by", ctx.session["participant_id"]))
+        ctx.orch.save()
+        return out
 
     # ---- unauthenticated login endpoints ---------------------------------
     def _public_session_path(self, ctx):
@@ -717,6 +810,11 @@ def _read_scope_for(path: str) -> str | None:
         return "audit"
     if path == "/api/export":
         return "export"
+    if path in ("/api/tlog/status", "/api/tlog/head", "/api/tlog/leaves",
+                "/api/tlog/inclusion", "/api/tlog/consistency",
+                "/api/tlog/bundle", "/api/tlog/splits") or \
+            path.startswith("/api/tlog/"):
+        return "transparency"
     if path.startswith("/api/ceremonies/"):
         return "ceremonies"
     return None
