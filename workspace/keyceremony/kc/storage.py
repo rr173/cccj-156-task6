@@ -209,7 +209,7 @@ class Store:
     @staticmethod
     def _empty_state() -> dict:
         return {
-            "schema": 3,
+            "schema": 4,
             "participants": {},   # participant_id -> record
             "devices": {},        # device_id -> EnrolledDevice dict
             "policies": {},       # policy_id -> Policy dict
@@ -226,5 +226,8 @@ class Store:
             "drill_plans": {},    # plan_id -> revisioned drill plan record
             "drills": {},         # drill_id -> drill run record (lifecycle)
             "drill_regions": {},  # region_name -> simulated region registry
+            # caller-facing transparency log checkpoint (public-only leaves,
+            # signed Merkle tree heads, split-view evidence) is initialized
+            # lazily by TransparencyLog(embedded=True)
             "sequence": 0,
         }

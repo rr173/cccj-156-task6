@@ -170,6 +170,63 @@ python3 -m kc.archive_cli verify    bundle.json
 
 ---
 
+## 1e. 面向调用方的透明度日志（可公开核对的 Merkle 树 + Gossip 监督）
+
+版本目录的每一次生命周期变更——**创建（初代 ACTIVE / 换代 STAGED）、启用
+（handover ACTIVE）、交接退役（RETIRING）、抹除（DESTROYED）**——都生成一片
+规范化叶子，叶子同时绑定：
+
+```
+purpose, version, version_id, 公钥 signing_pub + fingerprint,
+state{prev, next}(状态摘要), ceremony_id, audit_ref（授权该变更的审计条目 hash）
+```
+
+叶子**只含公开材料**：公钥、指纹、状态摘要、仪式 id、审计引用；份额、签名种子、
+服务封装材料永不进入叶子（叶子由编排器仅用公开字段构造）。叶子进入仅追加的
+RFC 6962 式 Merkle 树；每次提交发布带服务身份 Ed25519 签名的 tree head
+`{tree_size, root_hash, prev_head_hash, issued_at}`，head 之间以 `head_hash`
+逐个头尾相接。
+
+| 需求 | 实现方式 |
+|---|---|
+| **客户端仅凭旧 (size, root) 确认严格追加** | 包含证明与一致性证明的节点**位置完全由 `(index,size)`/`(old,new)` 递归派生**，服务端只能填兄弟哈希；验证器同时重算旧根与新根，旧根与客户端固定值比对（preimage 绑定）。截断历史、重排叶子、替换公钥、伪造状态跳转、拼入另一棵树的路径都失败。算法对树大小 0..260 的全部 `(index,size)`/`(old,new)` 组合穷举测试。 |
+| **同一业务变更不重复入账** | 业务键 `audit_ref|version_id|event` 全局去重；同一审计事件被多构建器重复投递，返回**原叶子序号**，树大小只增长一次。 |
+| **同一版本矛盾状态必须阻止新 head** | 每个 `(purpose,version)` 维护日志状态机（`NONE→CREATED/STAGED`、`STAGED→ACTIVATED`、`CREATED/ACTIVATED→RETIRED`、`RETIRED→ERASED`），且 `(purpose,version)` **永久绑定同一公钥/指纹**；prev 与日志现状不符或换钥即 `TRANSPARENCY_CONTRADICTION`，不挑选其一继续。 |
+| **单一提交边界** | “分配序号 → 写叶子 → 更新树节点 → 发布 head”为一个事务。独立模式：`pending/<txn>.json` 意图 fsync → 追加叶子行 fsync → checkpoint 单次原子 rename。重开时在 flock 内恢复：叶子已持久化则**前滚**补发完整新 head，否则**回滚**截断悬空叶子；只能看到完整旧 head 或完整新 head。测试在“写叶子/更新节点/发布 head”附近（含 rename 后）用真实子进程 `os._exit` 注入中断。嵌入模式与编排器共用 `state.json` 原子 rename 边界。 |
+| **多服务进程并发追加** | 独立构建器自带跨线程 RLock + flock，所有临时文件名带 pid+随机后缀，log 身份用 `O_CREAT\|O_EXCL` 原子认领；拿锁后先从磁盘重载再恢复。两个发布者争抢同一树大小时恰好一个生效，输方读到已生效结果（同业务键幂等）。测试 6 进程并发追加 12 个不同叶子 + 6 次重复投递，最终序号 0..16 确定无遗漏、head 链连续。 |
+| **抹除后公开材料仍可查** | DESTROY 只零化私钥封装，叶子与公钥/指纹永久保留；旧代的包含证明、状态历史、历史签名验签照常。 |
+| **Gossip split-view** | 浏览器/外部监控可免登录 `POST /api/transparency/observe` 提交自己见到的**已签名 head**。同树大小出现不同根（`SAME_SIZE_DIFFERENT_ROOT`），或更大 head 不能由本地较小 head 的一致性证明推出（`LARGER_HEAD_NOT_EXTENSION`），记录 split-view 事件并**冻结透明度发布**。被拒 head 原样保留为证据。 |
+| **冻结不影响历史验签，但阻止新密钥激活** | 冻结期间 `sign/verify` 与全部历史验证照常；GENERATE/ROTATE 的物化 commit 与 handover 发布（含四眼批准路径）抛 `TRANSPARENCY_FROZEN`，杜绝“已激活但无透明度叶子”。 |
+| **带原因的分支处置** | `POST /api/transparency/resolve`（仅 ROOT_OWNER）必须选**可证明延伸自本地链/最后可信 head** 的分支并填写原因；另一分支作为拒绝证据保留，随后重建从最后可信 head 开始的连续链，发布恢复。无原因/选择不可验证分支都被拒绝。 |
+| **管理页面浏览器侧自行验算** | `/transparency` 展示当前 head、树大小、各用途最新公开版本、待记录状态事件、split-view 与处置记录。包含/一致性/head 签名全部在浏览器侧用 Web Crypto(SHA-256) 与内置纯 JS Ed25519(RFC 8032，含 SHA-512) **重新计算并明确显示通过/失败**，不把“接口返回成功”当结果；固定的可信 head 存 localStorage，刷新后保留。 |
+| **独立检查程序** | `python -m kc.transparency_cli verify <export.json|section.json>` 输入叶子集合、head 链、签名、split 处置记录，重算全部根并校验生命周期。检出：缺叶(`MISSING_LEAF`)、重复业务事件(`DUPLICATE_BUSINESS_EVENT`)、叶子调序/换钥(`LEAF_REORDERED`)、错误包含证明(`BAD_INCLUSION_PROOF`)、断裂一致性(`BROKEN_CONSISTENCY`)、head 签名替换(`HEAD_SIGNATURE_REPLACED`)、同大小双根(`SAME_SIZE_TWO_ROOTS`)、跳过冲突直接发布(`PUBLISHED_DURING_SPLIT`)、密钥已激活但无叶子(`ACTIVATION_WITHOUT_LEAF`)、非法状态跳转(`ILLEGAL_LIFECYCLE_EDGE`)、换钥绑定(`CONTRADICTORY_KEY_BINDING`)、处置无效/拒绝证据缺失等。导出包整体校验新增 `transparency_ok`。 |
+
+透明度公开接口（**均免登录**，任何调用方/监控都能核对；处置需 ROOT_OWNER 令牌）：
+
+```
+GET  /transparency                         管理页面（浏览器侧验算）
+GET  /api/transparency/log-pub             日志签名公钥
+GET  /api/transparency/status              head/树大小/各用途最新版本/待记录事件/split-view
+GET  /api/transparency/head?size=n         指定树大小的已签名 head
+GET  /api/transparency/leaves              全部公开叶子
+GET  /api/transparency/inclusion?purpose=&version= | version_id= | audit_ref= | leaf_index=
+                                           叶子 + 包含路径 + 签名 head
+GET  /api/transparency/consistency?old_size=n
+                                           从旧 head 到当前 head 的一致性路径
+POST /api/transparency/observe             {head} 提交外部见到的已签名 head（gossip）
+POST /api/transparency/resolve             {split_id, chosen_head, reason}（仅 ROOT_OWNER）
+```
+
+离线核验：
+
+```bash
+python -m kc.verify_export --from-store ./kc-data --outdir ./export
+python -m kc.transparency_cli verify ./export/export.json
+# transparency_ok 同时包含在 verify_export 的 [PASS] 清单中
+```
+
+---
+
 
 ## 2. 目录结构
 
@@ -189,6 +246,12 @@ kc/
   archive_verify.py 档案离线验证器：删段/换段/伪造/断链/重复计入/越缺口/未决发布/根篡改
   archive_server.py 档案 HTTP API + 汇聚台（archive.html）
   archive_cli.py  档案命令行（init/register/mksample/worker/recover/resolve/publish/export/verify）
+  transparency.py 调用方透明度日志：规范化公开叶子、RFC 6962 Merkle 树/包含/一致性、
+                  签名 tree head、单事务原子提交（独立/嵌入）、多进程追加、gossip
+                  split-view 冻结与带原因处置
+  transparency_verify.py 独立检查器：重算全部根/证明/head 链/生命周期/双根/未登记激活
+  transparency_cli.py 独立检查命令行（verify export.json|section.json）
+  transparency.html 透明度管理页面：浏览器侧 Web Crypto + 纯 JS Ed25519 自行验算
   sessions.py     终端证明登录：挑战/报价、绑定人员·职责·终端·时效的会话令牌
   authz.py        四眼授权单：冻结摘要/截止、互补职责矩阵、决策链、单次执行
   console.py      设备侧代理：证明→取件→验份额→签名确认
@@ -208,8 +271,15 @@ tests/
   test_archive.py     35 个审计档案场景（乱序补齐、重复幂等、同序冲突隔离与处置、
                       拒绝版本幂等、中断续跑、线程/进程收敛、门限拒绝、CAS 唯一发布、
                       迟到数据进下一轮、离线验证正常通过与 12 类篡改失败、HTTP 全流程）
+  test_transparency.py 36 个透明度场景（Merkle 包含/一致性全几何穷举与篡改、公开性、
+                      业务去重、矛盾状态/换钥阻止 head、多进程单序并发、四类中断
+                      原子前滚/回滚、split-view 冻结/冻结期阻断激活/处置恢复/重启保留、
+                      嵌入编排器两代证明与多次变更一致性、独立检查器 10 类检出）
   http_e2e.py         HTTP 全流程含登录门禁、四类授权单、6 路并发批准、库直调不受限
   drill_http_e2e.py   演练 HTTP 全流程（区域/修订/扫描/续跑/镜像/冻结/租约/受阻清理/证据）
+  transparency_http_e2e.py 透明度 HTTP 全流程（公开证明、node 执行页面 JS 浏览器侧验算、
+                      gossip 冻结、冻结期四眼发布被阻、历史验签可用、owner 带原因
+                      处置后四眼发布恢复、一致性严格追加、拒绝分支留证）
 ```
 
 ## 3. 快速开始
@@ -347,11 +417,12 @@ Feldman VSS 逐份验证、安全素数群子群一致性）。生产部署时�
 
 ```bash
 python3 tests/smoke_e2e.py
-python3 -m unittest tests.test_ceremonies tests.test_edge tests.test_authz tests.test_drills -v
+python3 -m unittest tests.test_ceremonies tests.test_edge tests.test_authz tests.test_drills tests.test_archive tests.test_transparency -v
 python3 tests/http_e2e.py 8211          # 登录门禁 + 四类四眼授权单 + 6 路并发批准 + 库直调
 python3 tests/drill_http_e2e.py 8212    # 跨区域灾备演练 HTTP 全流程
+python3 tests/transparency_http_e2e.py 8213  # 透明度证明/浏览器验算/split 冻结处置
 # 或一次跑完：
-./run_tests.sh 8301 8302
+./run_tests.sh 8301 8302 8303
 ```
 
 ## 12. 一次四眼操作的示例（发布新代）

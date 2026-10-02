@@ -116,6 +116,7 @@ CAPABILITIES: dict[str, frozenset[str]] = {
         "ticket:create", "ticket:approve", "ticket:withdraw",
         "drill:plan", "drill:scan", "drill:run", "drill:mirror",
         "drill:lease", "drill:failback", "drill:terminate",
+        "transparency:resolve",
     }),
     P.KEY_STEWARD: frozenset({
         "ceremony:open", "device:step", "sign:use",

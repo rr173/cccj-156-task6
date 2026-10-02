@@ -40,6 +40,15 @@ from .errors import (
     ReplayError, SealError,
 )
 from .storage import AuditLog, Store
+from .transparency import (
+    ACTIVATED as TL_ACTIVATED,
+    CREATED as TL_CREATED,
+    ERASED as TL_ERASED,
+    NONE_STATE as TL_NONE,
+    RETIRED as TL_RETIRED,
+    STAGED as TL_STAGED,
+    TransparencyLog,
+)
 
 STAGE_ORDER = ("OPEN", "ATTESTED", "DELIVERED", "CONFIRMED", "COMMIT", "COMPLETED")
 OPEN_STATUS = "OPEN"
@@ -65,6 +74,14 @@ class Orchestrator:
         self.seed = store.service_seed()
         self.audit = AuditLog(store.audit_path, signer_seed=self.seed)
         self.dir = KeyDirectory(self.state, self.seed, clock=clock)
+        # Caller-facing append-only transparency log. Its checkpoint lives
+        # inside the same locked state.json (single durability boundary), so
+        # a lifecycle change and its transparency leaf commit or abort
+        # together; the separate public verification material (keys,
+        # fingerprints, state summaries, audit refs) is all that is logged.
+        self.tlog = TransparencyLog(
+            service_seed=self.seed, state=self.state, clock=clock,
+            embedded=True)
 
     # ======================================================================
     # enrollment / policy
@@ -327,8 +344,21 @@ class Orchestrator:
     def _policy(self, c: dict) -> pol.Policy:
         return pol.Policy.from_dict(c["policy_snapshot"])
 
-    def _audit(self, event: str, payload: dict):
-        self.audit.append(event, payload)
+    def _audit(self, event: str, payload: dict) -> dict:
+        return self.audit.append(event, payload)
+
+    def _tleaf(self, kv: dict, event: str, prev_state: str,
+               audit_entry: dict):
+        """Append the public-only transparency leaf for one lifecycle change.
+        The authorizing audit entry's content hash is the business-event
+        reference: a retried change returns its original leaf index instead of
+        inserting a second leaf."""
+        from .transparency import make_leaf
+        leaf = make_leaf(
+            kv["purpose"], kv["version"], kv["id"], kv["fingerprint"],
+            kv["signing_pub"], event, prev_state, kv["source_ceremony"],
+            audit_entry["hash"])
+        return self.tlog.record(leaf)
 
     def _spend_nonce(self, body: dict):
         nonce = body["nonce"]
@@ -699,6 +729,10 @@ class Orchestrator:
 
         result = {"actor": actor, "at": _now(self.clock)}
         if c["kind"] in (pol.GENERATE, pol.ROTATE):
+            # A frozen transparency log cannot publish a new head, so new key
+            # material must not appear: activation without a leaf would be an
+            # unlogged key, which the independent checker is built to flag.
+            self.tlog.require_unfrozen()
             pending = c["deal"]["pending"]
             seed = crypto.b64d(pending["signing_seed"])
             pub = crypto.b64d(pending["signing_pub"])
@@ -713,15 +747,21 @@ class Orchestrator:
             result["key_version"] = kv["id"]
             result["status"] = kv["status"]
             if kv["status"] == ACTIVE:
-                self._audit("key_activated",
+                entry = self._audit("key_activated",
                             {"ceremony_id": c["id"], "version_id": kv["id"],
                              "purpose": kv["purpose"], "version": kv["version"],
-                             "fingerprint": kv["fingerprint"]})
+                             "fingerprint": kv["fingerprint"],
+                             "signing_pub": kv["signing_pub"]})
+                result["transparency"] = self._tleaf(
+                    kv, TL_CREATED, TL_NONE, entry)
             else:
-                self._audit("key_staged",
+                entry = self._audit("key_staged",
                             {"ceremony_id": c["id"], "version_id": kv["id"],
                              "purpose": kv["purpose"], "version": kv["version"],
-                             "fingerprint": kv["fingerprint"]})
+                             "fingerprint": kv["fingerprint"],
+                             "signing_pub": kv["signing_pub"]})
+                result["transparency"] = self._tleaf(
+                    kv, TL_STAGED, TL_NONE, entry)
             c["result"] = result
         elif c["kind"] == pol.BACKUP:
             current = self.dir.active(c["purpose"])
@@ -757,10 +797,15 @@ class Orchestrator:
             result["key_version"] = kv["id"]
             result["destroyed"] = True
             c["result"] = result
-            self._audit("key_destroyed",
+            entry = self._audit("key_destroyed",
                         {"ceremony_id": c["id"], "version_id": kv["id"],
                          "purpose": kv["purpose"], "version": kv["version"],
-                         "fingerprint": kv["fingerprint"]})
+                         "fingerprint": kv["fingerprint"],
+                         "signing_pub": kv["signing_pub"]})
+            result["transparency"] = self._tleaf(
+                kv, TL_ERASED,
+                self.tlog.state_of(kv["purpose"], kv["version"]) or TL_RETIRED,
+                entry)
 
         c["stage"] = "COMPLETED"
         c["status"] = DONE_STATUS
@@ -793,6 +838,10 @@ class Orchestrator:
             raise RaceLost(
                 f"publish race: expected {expected_active} to be current, "
                 f"but directory says {current_id}")
+        # Freezing transparency publication blocks handover activation even
+        # though the staged successor already exists; historical verification
+        # remains unaffected.
+        self.tlog.require_unfrozen()
         if c.get("published"):
             # Already published and pointer matches: idempotent success.
             return self.public_ceremony(ceremony_id)
@@ -804,10 +853,24 @@ class Orchestrator:
         kv["handover_deadline"] = deadline
         if old:
             old["handover_deadline"] = deadline
-        self._audit("rotation_published",
+        entry = self._audit("rotation_published",
                     {"ceremony_id": c["id"], "new": kv["id"],
                      "old": old["id"] if old else None,
-                     "handover_deadline": deadline, "actor": actor})
+                     "handover_deadline": deadline, "actor": actor,
+                     "new_fingerprint": kv["fingerprint"],
+                     "new_signing_pub": kv["signing_pub"]})
+        # Transparency handover: the successor enters ACTIVE and the displaced
+        # predecessor enters RETIRED, each as its own canonical leaf. One
+        # audit entry authorizes both; the audit hash is the shared reference
+        # (business keys differ by version id, so neither dedups the other).
+        leaves = [self._tleaf(kv, TL_ACTIVATED, TL_STAGED, entry)]
+        if old is not None:
+            # predecessor's logged state is CREATED for the first generation
+            # (ACTIVE directly) or ACTIVATED for a previously rotated key.
+            old_prev = self.tlog.state_of(old["purpose"], old["version"])
+            leaves.append(self._tleaf(old, TL_RETIRED, old_prev, entry))
+        c.setdefault("published_leaves", []).append(
+            [l["index"] for l in leaves])
         return self.public_ceremony(c["id"])
 
     def abort(self, ceremony_id: str, actor: str, reason: str) -> dict:

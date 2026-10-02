@@ -50,8 +50,10 @@ from .storage import Store
 from . import export as export_mod
 
 CONSOLE_HTML = os.path.join(os.path.dirname(__file__), "console.html")
+TRANSPARENCY_HTML = os.path.join(os.path.dirname(__file__), "transparency.html")
 
-PUBLIC_GET = {"/", "/index.html", "/health"}
+PUBLIC_GET = {"/", "/index.html", "/health", "/transparency",
+              "/transparency.html"}
 PUBLIC_POST = {"/api/session/login-challenge", "/api/session/login"}
 
 # Device-step endpoints require the session to own the addressed terminal.
@@ -166,8 +168,17 @@ class Handler(BaseHTTPRequestHandler):
         path, q = u.path, parse_qs(u.query)
         if path in ("/", "/index.html"):
             return self._serve_console()
+        if path in ("/transparency", "/transparency.html"):
+            return self._serve_transparency()
         if path == "/health":
             return self._send(200, {"ok": True})
+
+        # Caller-facing transparency endpoints are intentionally public: any
+        # monitor/browser must fetch heads and proofs without operator rights.
+        if path.startswith("/api/transparency/"):
+            return self._with_ctx(
+                lambda ctx: self._transparency_query(ctx, path, q),
+                require_auth=False)
 
         def run(ctx):
             az = ctx.authz
@@ -239,6 +250,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in PUBLIC_POST:
             return self._with_ctx(lambda ctx: self._public_session_path(ctx),
                                   require_auth=False)
+        # Public gossip observer: anyone may submit a head they witnessed.
+        if path == "/api/transparency/observe":
+            return self._with_ctx(
+                lambda ctx: self._transparency_observe(ctx),
+                require_auth=False)
 
         def run(ctx):
             return self._dispatch(ctx, path)
@@ -256,6 +272,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(html)
         except FileNotFoundError:
             self._send(404, {"error": "console unavailable"})
+
+    def _serve_transparency(self):
+        try:
+            with open(TRANSPARENCY_HTML, "rb") as f:
+                html = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+        except FileNotFoundError:
+            self._send(404, {"error": "transparency page unavailable"})
 
     # ---- unauthenticated login endpoints ---------------------------------
     def _public_session_path(self, ctx):
@@ -383,6 +411,14 @@ class Handler(BaseHTTPRequestHandler):
         # ---- cross-region disaster recovery drills ----
         if path.startswith("/api/drill"):
             return self._drill_dispatch(ctx, path)
+
+        # ---- transparency split-view resolution (four-eyes-equivalent:
+        # ROOT_OWNER with a recorded reason) ----
+        if path == "/api/transparency/resolve":
+            AZ.Authz.require_cap(ctx.session, "transparency:resolve")
+            return ctx.orch.tlog.resolve_split(
+                b["split_id"], b["chosen_head"], b.get("reason", ""),
+                ctx.session["participant_id"])
         raise NotFound("unknown path")
 
     # ---- device-step endpoints (session must own the terminal) -----------
@@ -425,6 +461,41 @@ class Handler(BaseHTTPRequestHandler):
         return ctx.orch.commit(
             cid, ctx.session["participant_id"],
             expected_active=b.get("expected_active"))
+
+    # ---- transparency: public proofs + gossip + operator resolution -------
+    def _transparency_query(self, ctx, path, q):
+        tl = ctx.orch.tlog
+        if path == "/api/transparency/status":
+            return tl.status()
+        if path == "/api/transparency/head":
+            size = q.get("size", [None])[0]
+            if size is None:
+                return tl.current_head()
+            return tl.head_at_size(int(size))
+        if path == "/api/transparency/inclusion":
+            return tl.inclusion_for(
+                purpose=q.get("purpose", [None])[0],
+                version=int(q["version"][0]) if "version" in q else None,
+                version_id=q.get("version_id", [None])[0],
+                audit_ref=q.get("audit_ref", [None])[0],
+                leaf_index=int(q["leaf_index"][0])
+                if "leaf_index" in q else None)
+        if path == "/api/transparency/consistency":
+            old_size = int(q.get("old_size", ["0"])[0])
+            return tl.consistency(old_size)
+        if path == "/api/transparency/log-pub":
+            return {"log_pub": crypto.b64e(
+                crypto.ed25519.public_from_secret(ctx.orch.seed))}
+        if path == "/api/transparency/leaves":
+            return {"tree_size": tl.size,
+                    "leaves": tl._committed_leaves()}
+        raise NotFound("unknown transparency path")
+
+    def _transparency_observe(self, ctx):
+        b = ctx.body
+        observer = b.get("observer", "external")
+        head = b.get("head") if isinstance(b.get("head"), dict) else b
+        return ctx.orch.tlog.observe_head(head, observer=observer)
 
     # ---- cross-region disaster recovery drills ---------------------------
     def _drill_dispatch(self, ctx, path: str):

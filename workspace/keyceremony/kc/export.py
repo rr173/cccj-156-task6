@@ -80,6 +80,7 @@ def build_bundle(orch, sessions=None, authz_mod=None) -> dict:
         "drills": [_public_drill(d) for d in s.get("drills", {}).values()],
         "drill_evidence": list(s.get("drill_evidence", {}).values()),
         "drill_regions": dict(s.get("drill_regions", {})),
+        "transparency": _transparency_section(orch),
     }
     body["invariants"] = {
         "body_hash_excluding_sig": crypto.digest_hex(
@@ -111,6 +112,33 @@ def _public_key(k: dict) -> dict:
             "created_at", "activated_at", "retired_at", "destroyed_at",
             "destroy_ceremony", "handover_deadline")
     return {f: k.get(f) for f in keep}
+
+
+def _transparency_section(orch) -> dict:
+    """Public-only transparency evidence: leaves, signed head chain, split
+    views and resolutions. Never includes seeds, shares or wraps - the leaves
+    already contain only public keys, fingerprints, state and audit refs."""
+    cp = orch.state.get("transparency")
+    if cp is None:
+        return {"format": "kc-transparency-v1", "size": 0,
+                "leaves": [], "heads": [], "observations": [],
+                "splits": [], "resolutions": [], "frozen": None,
+                "log_pub": crypto.b64e(
+                    ed25519.public_from_secret(orch.seed))}
+    return {
+        "format": "kc-transparency-v1",
+        "log_pub": crypto.b64e(ed25519.public_from_secret(orch.seed)),
+        "size": cp["size"],
+        "root": cp["root"],
+        "leaves": cp.get("leaf_records", []),
+        "heads": cp.get("heads", []),
+        "observations": cp.get("observations", []),
+        "splits": cp.get("splits", []),
+        "resolutions": cp.get("resolutions", []),
+        "frozen": cp.get("frozen"),
+        "trusted": {"size": cp.get("trusted_size", 0),
+                    "root": cp.get("trusted_root")},
+    }
 
 
 # Fields of drill plans/runs that must never leave the store in an export.
@@ -321,6 +349,19 @@ def verify_bundle(bundle: dict) -> dict:
     # 8. cross-region drill evidence archives
     drills_ok = _verify_drill_evidence(bundle, pub, problems)
     checks["drill_evidence_ok"] = drills_ok
+
+    # 9. caller-facing transparency log (roots, proofs, head chain, lifecycle,
+    # split-view handling, and every materialized key having a leaf)
+    tl_section = bundle.get("transparency") or {}
+    if not tl_section.get("log_pub"):
+        tl_section = {**tl_section,
+                      "log_pub": bundle.get("service_identity_pub")}
+    from .transparency_verify import verify_transparency
+    tv = verify_transparency(tl_section, keys=keys, audit=bundle["audit"])
+    checks["transparency_ok"] = tv["ok"]
+    checks["transparency_leaves"] = tv["n_leaves"]
+    for f in tv["findings"]:
+        problems.append(f"transparency: {f['code']} {f['message']}")
 
     return {"ok": not problems, "problems": problems, "checks": checks}
 

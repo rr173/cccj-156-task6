@@ -5,6 +5,7 @@ Public surface:
 """
 
 from . import authz, crypto, drills, ed25519, evidence, policy, regions, sessions
+from . import transparency, transparency_verify
 from .attestation import DeviceWallet, EnrolledDevice, provision_device
 from .authz import Authz
 from .ceremony import Orchestrator
